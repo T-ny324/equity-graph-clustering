@@ -2,12 +2,16 @@ universe:
   name: sp100
   min_history_days: 1260        # 5y — names with less are dropped
   max_missing_frac: 0.02
+  min_session_coverage: 0.80    # fraction of tickers needed for a valid session
+  max_ffill_days: 3             # hard cap on carrying a stale price
 
 data:
   start: "2015-01-01"
   end: null                      # null = today
   raw_dir: data/raw
   processed_dir: data/processed
+  batch_size: 25
+  pause: 1.0
 
 graph:
   corr_window: 252               # T, from section 1.0
