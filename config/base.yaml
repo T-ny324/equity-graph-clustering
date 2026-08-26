@@ -1,0 +1,14 @@
+universe:
+  name: sp100
+  min_history_days: 1260        # 5y — names with less are dropped
+  max_missing_frac: 0.02
+
+data:
+  start: "2015-01-01"
+  end: null                      # null = today
+  raw_dir: data/raw
+  processed_dir: data/processed
+
+graph:
+  corr_window: 252               # T, from section 1.0
+  rebalance: "ME"                # month-end
