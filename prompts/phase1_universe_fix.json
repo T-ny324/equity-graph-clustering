@@ -1,0 +1,126 @@
+{
+    "task": "Apply Phase 1 universe-construction fixes: resolve ticker renames, exclude confirmed delistings, and enforce a fixed-N universe with full history from the sample start date.",
+  
+    "context": {
+      "project": "Dynamic equity clustering with temporal GNNs. Phase 1 (data) is complete but the universe construction has three defects found during the first full ingest run.",
+      "repo_root": "the current working directory; run all commands from here",
+      "relevant_files": [
+        "src/data/ingest.py",
+        "src/data/clean.py",
+        "config/base.yaml",
+        "data/universe_sp100.csv",
+        "README.md"
+      ],
+      "defects": [
+        "Five requested tickers returned no data. Two of them (BK, FI) are ticker RENAMES with intact price history under new symbols, and are currently being lost for no reason. Three (DFS, HES, IPG) are genuine M&A delistings.",
+        "Symbol resolution is implicitly delegated to Yahoo, so the universe silently changes over time. It must be pinned in the committed CSV instead.",
+        "Six tickers listed after the configured sample start date (DOW, FOX, FOXA, IR, INVH, HPE) pass the current min_history_days filter but have no data early in the sample. This makes N time-varying, which will produce structurally NaN correlation matrices in Phase 3."
+      ],
+      "verified_facts": {
+        "BK": "Bank of New York Mellon changed its ticker from BK to BNY effective 2026-05-21. History is intact under BNY.",
+        "FI": "Fiserv moved its listing from NYSE to Nasdaq and now trades as FISV. History is intact under FISV.",
+        "DFS": "Discover Financial merged into Capital One on 2025-05-18 and was delisted from the NYSE.",
+        "HES": "Treat as an M&A delisting (Chevron). No recoverable series.",
+        "IPG": "Treat as an M&A delisting (Omnicom). No recoverable series."
+      }
+    },
+  
+    "changes": [
+      {
+        "file": "data/universe_sp100.csv",
+        "goal": "Make the CSV the single pinned source of truth for symbol resolution.",
+        "instructions": [
+          "Add three columns, preserving all existing rows and columns: 'yahoo_ticker', 'status', 'notes'.",
+          "For every row, default yahoo_ticker = ticker, status = 'active', notes = ''.",
+          "Set BK: yahoo_ticker='BNY', status='renamed', notes='ticker changed BK->BNY 2026-05-21'.",
+          "Set FI: yahoo_ticker='FISV', status='renamed', notes='NYSE->Nasdaq, ticker FI->FISV'.",
+          "Set DFS: status='delisted', notes='merged into Capital One 2025-05-18'.",
+          "Set HES: status='delisted', notes='acquired by Chevron'.",
+          "Set IPG: status='delisted', notes='merged with Omnicom'.",
+          "Do NOT delete the delisted rows. They are the documented record of survivorship exclusions."
+        ]
+      },
+      {
+        "file": "src/data/ingest.py",
+        "goal": "Resolve symbols from the CSV rather than from implicit Yahoo behaviour.",
+        "instructions": [
+          "Rewrite load_universe() to read the CSV, filter to status != 'delisted', and return the sorted unique list of yahoo_ticker values (still applying the existing dot-to-dash normalisation and uppercasing).",
+          "Have load_universe() print a summary line: how many rows total, how many active, how many renamed, how many excluded as delisted.",
+          "Do not hardcode any ticker mapping inside ingest.py. The CSV is the source of truth."
+        ]
+      },
+      {
+        "file": "config/base.yaml",
+        "goal": "Add the fixed-universe controls.",
+        "instructions": [
+          "Under the 'universe' key add: require_full_history: true, and start_tolerance_days: 7.",
+          "Leave all existing keys unchanged.",
+          "Add a brief YAML comment above each new key explaining its purpose."
+        ]
+      },
+      {
+        "file": "src/data/clean.py",
+        "goal": "Enforce a fixed-N rectangle by dropping names not trading at the sample start.",
+        "instructions": [
+          "Add a function filter_full_history(close: pd.DataFrame, tolerance_days: int) -> list[str] that returns tickers whose first valid close falls on or before close.index[0] + Timedelta(days=tolerance_days).",
+          "Call it inside build_panel AFTER the calendar has been built and the frames reindexed onto it (the existing second-pass filter step), gated on cfg['universe']['require_full_history'].",
+          "Print the count and the sorted list of tickers dropped by this filter, with each ticker's first valid date, so the exclusion is auditable in the run log.",
+          "After all filtering and filling, assert that wide['close'].notna().all().all() is True, raising a clear AssertionError naming the offending tickers if not. This is the fixed-N guarantee Phase 3 depends on.",
+          "Do not change the existing filter ordering: pre-calendar filter, then calendar construction, then post-calendar filter. The new filter belongs in the post-calendar pass."
+        ]
+      },
+      {
+        "file": "tests/test_universe.py",
+        "goal": "Lock in the fixes so they cannot silently regress.",
+        "instructions": [
+          "Create this file if it does not exist.",
+          "Test 1: load_universe() returns a list containing 'BNY' and 'FISV' and containing none of 'BK', 'FI', 'DFS', 'HES', 'IPG'.",
+          "Test 2: filter_full_history correctly drops a synthetic ticker whose first valid value is 60 days after the index start, and keeps one starting on day 0 and one starting on day 3 with tolerance 7.",
+          "Use pytest. Build small synthetic DataFrames inline; do not read the real data files in tests."
+        ]
+      },
+      {
+        "file": "README.md",
+        "goal": "Document the data provenance honestly.",
+        "instructions": [
+          "Add a '## Data provenance and known limitations' section.",
+          "State that the universe is a historical S&P 100 snapshot applied retrospectively, not a point-in-time membership series, so results are conditioned on survival.",
+          "List the three delisted names and why they are absent.",
+          "List the two renamed names and how they are resolved.",
+          "State that names not trading on the sample start date are excluded to keep N fixed, name them, and note that a time-varying universe is the methodologically superior extension left for future work.",
+          "Keep this section factual and concise. Do not editorialise about model quality."
+        ]
+      }
+    ],
+  
+    "constraints": [
+      "Do not modify the reshape, download, retry, or batching logic in ingest.py. Only load_universe changes.",
+      "Do not modify the fill rule, the derived-series logic, or the return-masking behaviour in clean.py.",
+      "Do not add new third-party dependencies.",
+      "Do not delete or rewrite data files. The only data file edited is the universe CSV, and only by adding columns and values.",
+      "Preserve existing type hints, docstring style, and the print-based run logging already used in both modules.",
+      "Make no changes outside the files listed above."
+    ],
+  
+    "verification": {
+      "steps": [
+        "rm -rf data/raw/_batches  # force a fresh download with the corrected symbols",
+        "python -m pytest tests/test_universe.py -v",
+        "python -m src.data.ingest",
+        "python -m src.data.clean"
+      ],
+      "expected": [
+        "ingest reports 111 tickers requested (114 rows minus 3 delisted) and 111 returned, with no NO DATA RETURNED line",
+        "clean reports the full-history filter dropping approximately 6 tickers (expected: DOW, FOX, FOXA, IR, INVH, HPE)",
+        "final panel reports approximately 105 tickers and a start date near the configured sample start",
+        "the no-NaN assertion passes"
+      ],
+      "on_mismatch": "Report the actual numbers and the dropped-ticker lists rather than adjusting thresholds to force the expected counts. The counts are predictions to be tested, not targets."
+    },
+  
+    "deliverables": [
+      "A summary of the final panel shape: number of tickers, number of sessions, date range.",
+      "The exact list of tickers dropped by the full-history filter, with their first valid dates.",
+      "A single git commit with message: 'Phase 1 fix: pin universe symbols, exclude delistings, enforce fixed-N full-history universe'"
+    ]
+  }
