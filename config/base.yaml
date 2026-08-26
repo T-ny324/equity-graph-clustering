@@ -4,6 +4,12 @@ universe:
   max_missing_frac: 0.02
   min_session_coverage: 0.80    # fraction of tickers needed for a valid session
   max_ffill_days: 3             # hard cap on carrying a stale price
+  # Keep N fixed: drop names not already trading at the sample start, so the
+  # panel is a complete rectangle and Phase 3 correlations are never NaN.
+  require_full_history: true
+  # Grace period for the first valid close, in calendar days after the first
+  # session — absorbs holidays and a late first print without admitting IPOs.
+  start_tolerance_days: 7
 
 data:
   start: "2015-01-01"
