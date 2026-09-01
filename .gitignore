@@ -1,4 +1,5 @@
 .venv/
 data/
+!data/universe_sp100.csv
 __pycache__/
 .ipynb_checkpoints/
