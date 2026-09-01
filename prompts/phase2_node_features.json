@@ -48,7 +48,7 @@
       {
         "name": "standardise",
         "signature": "standardise(X: pd.DataFrame, winsor: float = 3.0) -> pd.DataFrame",
-        "spec": "Robust cross-sectional standardisation at each date (axis=1). Centre on the row median, scale by row MAD * 1.4826 (the Gaussian consistency constant), clip to +/- winsor, then re-centre and re-scale so the output has approximately zero median and unit scale. Use median/MAD rather than mean/std because std is inflated by the very outliers being clipped, so a mean/std clip barely bites. Guard against zero MAD (a degenerate cross-section) by falling back to the row std, and if that is also zero return zeros for that row."
+        "spec": "Robust cross-sectional standardisation at each date (axis=1). Centre on the row median, scale by row MAD * 1.4826 (the Gaussian consistency constant), then clip to +/- winsor. Clipping MUST be the final operation: nothing may re-centre, re-scale or otherwise transform the values after the clip. Rescaling after clipping silently undoes it -- on a zero-inflated feature the post-clip MAD is near zero, so dividing by it pushes values back past the bound (observed: max 7.28 at winsor 3.0). The clip bound is a hard guarantee, not an approximation. Use median/MAD rather than mean/std because std is inflated by the very outliers being clipped, so a mean/std clip barely bites. Guard against zero MAD (a degenerate cross-section) by falling back to the row std, and if that is also zero return zeros for that row."
       },
       {
         "name": "assemble",
@@ -85,6 +85,11 @@
         "beta_252": "from market_beta(ret, 252)",
         "idio_vol_252": "from market_beta(ret, 252)"
       },
+      "excluded_by_default": {
+        "note": "Computed and standardised as usual, then dropped in assemble via config features.exclude. They remain defined so the decision stays visible and reversible.",
+        "amihud_63": "Correlates -0.962 with log_adv_63. Dollar volume is the denominator of Amihud, so with |log_ret| varying far less than volume the log of one is very nearly the negative log of the other. The pair is definitionally near-duplicate and carries roughly one dimension of signal, not two.",
+        "zero_ret_frac_63": "Zero-inflated: over 75% of values are exactly zero on this universe (measured: 77.6%). A feature that is constant across most of the cross-section contributes no separating information to a distance-based clusterer, and its few non-zero values dominate the standardised scale."
+      },
       "trend": {
         "mom_21": "rolling 21d sum of log_ret",
         "mom_63": "rolling 63d sum of log_ret",
@@ -100,7 +105,7 @@
       "cases": [
         "realised_vol: a series of i.i.d. normal returns with known sigma recovers approximately sigma * sqrt(252), within a generous tolerance.",
         "mom_252_21: on a series with constant daily return r, the value equals exactly 231 * r, confirming the most recent 21 days are excluded.",
-        "standardise: output rows have median approximately 0 and MAD-based scale approximately 1; a row containing one extreme outlier has that outlier clipped to the winsor bound.",
+        "standardise: output satisfies abs(z).max() <= winsor exactly; this is a test of the clipping guarantee itself, not a proxy for it. A row containing one extreme outlier has that outlier clipped to the winsor bound.",
         "standardise: a row of identical values returns zeros rather than NaN or inf (degenerate cross-section guard).",
         "dist_52w_high: is always <= 0, and equals 0 exactly on the day a series makes a new rolling maximum.",
         "no_lookahead: a canary test — build a returns frame, compute vol_63, corrupt the LAST row of returns to an extreme value, recompute, and assert that all feature values strictly before that date are unchanged. This is the single most important test in the file."

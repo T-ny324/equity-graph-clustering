@@ -115,18 +115,55 @@ def test_mom_252_21_excludes_the_most_recent_month() -> None:
 # ----------------------------------------------------------------------
 # Cross-sectional standardisation
 # ----------------------------------------------------------------------
-def test_standardise_centres_and_scales_each_row() -> None:
-    """Output rows have median ~0 and a MAD-based scale ~1."""
+def test_standardise_output_respects_the_winsor_bound() -> None:
+    """abs(z).max() <= winsor exactly.
+
+    This is a test of the clipping guarantee itself, not a proxy for it. The
+    scale of the output is deliberately NOT asserted: normalising after the
+    clip is what broke the bound in the first place.
+    """
     rng = np.random.default_rng(3)
     idx = pd.date_range("2020-01-31", periods=4, freq="ME")
     X = pd.DataFrame(rng.normal(size=(4, 200)), index=idx)
 
-    Z = nf.standardise(X)
-    med = Z.median(axis=1)
-    scale = Z.sub(med, axis=0).abs().median(axis=1) * nf.MAD_TO_SIGMA
+    Z = nf.standardise(X, winsor=3.0)
+    assert np.nanmax(np.abs(Z.to_numpy())) <= 3.0
+    assert np.allclose(Z.median(axis=1).to_numpy(), 0.0, atol=1e-9)
 
-    assert np.allclose(med.to_numpy(), 0.0, atol=1e-9)
-    assert np.allclose(scale.to_numpy(), 1.0, atol=1e-9)
+
+def test_clip_is_final() -> None:
+    """Regression: a zero-inflated column must not escape the bound.
+
+    The post-clip re-standardisation this replaces divided by a near-zero
+    post-clip MAD (or its std fallback) and pushed values back out. On the
+    real panel that produced X.max() = 7.28 against winsor = 3.0, driven
+    entirely by zero_ret_frac_63, which is ~78% exact zeros.
+    """
+    winsor = 3.0
+    rng = np.random.default_rng(19)
+    n = 100
+    row = np.zeros(n)
+    row[:20] = rng.uniform(4.0, 40.0, size=20)      # 80% zeros, a fat tail
+    X = pd.DataFrame([row], index=pd.to_datetime(["2020-01-31"]))
+
+    z = nf.standardise(X, winsor=winsor).to_numpy()
+    assert np.isfinite(z).all()
+    assert np.abs(z).max() <= winsor, f"escaped the bound: {np.abs(z).max()}"
+
+
+@pytest.mark.parametrize("zero_frac", [0.5, 0.75, 0.8, 0.9, 0.95])
+def test_clip_is_final_across_zero_inflation(zero_frac: float) -> None:
+    """The bound holds at every level of zero-inflation, not just one."""
+    winsor = 2.5
+    rng = np.random.default_rng(23)
+    n = 200
+    n_nz = int(n * (1.0 - zero_frac))
+    row = np.zeros(n)
+    row[:n_nz] = rng.lognormal(2.0, 1.5, size=n_nz)
+    X = pd.DataFrame([row], index=pd.to_datetime(["2020-01-31"]))
+
+    z = nf.standardise(X, winsor=winsor).to_numpy()
+    assert np.abs(z).max() <= winsor
 
 
 def test_standardise_clips_an_extreme_outlier_to_the_winsor_bound() -> None:
@@ -266,6 +303,39 @@ def test_assemble_stacks_in_date_ticker_feature_order() -> None:
     j = names.index("vol_63")
     expected = nf.standardise(features["vol_63"][tickers]).loc[dates].to_numpy()
     assert np.allclose(X[:, :, j], np.nan_to_num(expected), atol=1e-12)
+
+
+def test_assemble_excludes_named_features() -> None:
+    ret, close, dv = _inputs(n=400, n_tickers=3, seed=31)
+    features = _all_features(ret, close, dv)
+    dates = ret.index[[300, 340]]
+    drop = ["amihud_63", "zero_ret_frac_63"]
+
+    X, _, names = nf.assemble(features, dates, exclude=drop)
+
+    assert X.shape[2] == 15 - len(drop)
+    assert names == [n for n in nf.FEATURE_NAMES if n not in drop]
+    # Order of the survivors is unchanged, and the dropped ones are gone.
+    assert not set(drop) & set(names)
+
+
+def test_assemble_rejects_an_unknown_exclude_name() -> None:
+    ret, close, dv = _inputs(n=400, n_tickers=3, seed=33)
+    features = _all_features(ret, close, dv)
+    dates = ret.index[[300]]
+
+    with pytest.raises(ValueError, match="unknown feature"):
+        nf.assemble(features, dates, exclude=["vol_21", "not_a_feature"])
+
+
+def test_assembled_tensor_never_exceeds_the_winsor_bound() -> None:
+    """End-to-end: the guarantee survives standardise -> sample -> stack."""
+    ret, close, dv = _inputs(n=400, n_tickers=6, seed=37)
+    features = _all_features(ret, close, dv)
+    dates = ret.index[[300, 320, 340, 360]]
+
+    X, _, _ = nf.assemble(features, dates, winsor=3.0)
+    assert np.abs(X).max() <= 3.0
 
 
 def test_assemble_rejects_a_date_off_the_daily_clock() -> None:

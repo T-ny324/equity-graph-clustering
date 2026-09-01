@@ -368,9 +368,9 @@ def build_features(wide: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
 def standardise(X: pd.DataFrame, winsor: float = 3.0) -> pd.DataFrame:
     """Robust cross-sectional standardisation, one row (date) at a time.
 
-    Centres on the row median and scales by row MAD * 1.4826, then clips to
-    +/- `winsor` and re-centres and re-scales so the output has approximately
-    zero median and unit scale.
+    Centres on the row median, scales by row MAD * 1.4826, and clips to
+    +/- `winsor`. The clip is the LAST operation and nothing may rescale after
+    it: the bound is a hard guarantee that downstream code can rely on.
 
     Median/MAD rather than mean/std is not a stylistic choice: the standard
     deviation is itself inflated by the very outliers being clipped, so a
@@ -386,13 +386,19 @@ def standardise(X: pd.DataFrame, winsor: float = 3.0) -> pd.DataFrame:
     Returns
     -------
     pd.DataFrame
-        Same shape and labels as `X`. All-NaN rows stay NaN; degenerate rows
-        (zero spread) become zeros.
+        Same shape and labels as `X`, with every finite value in
+        [-winsor, +winsor]. All-NaN rows stay NaN; degenerate rows (zero
+        spread) become zeros.
 
     Notes
     -----
     Operates on axis=1 only. Standardising across time would leak the future
     into every past date.
+
+    An earlier version re-centred and re-scaled after clipping, which silently
+    undid it: on a zero-inflated feature the post-clip MAD is ~0, so the std
+    fallback divides by a small number and pushes values back past the bound
+    (observed: 7.28 at winsor 3.0). Do not reintroduce a post-clip transform.
     """
     med = X.median(axis=1)
     dev = X.sub(med, axis=0)
@@ -402,23 +408,19 @@ def standardise(X: pd.DataFrame, winsor: float = 3.0) -> pd.DataFrame:
     # Fall back to the row std; if that is zero too the row is degenerate and
     # dev is already all zeros, so dividing by 1.0 yields the zeros we want.
     scale = mad.where(mad > 0, X.std(axis=1))
-    Z = dev.div(scale.where(scale > 0, 1.0), axis=0).clip(-winsor, winsor)
 
-    # Clipping pulls the tails in, which shifts the median and shrinks the
-    # spread. Restore both so a feature is comparable across dates.
-    med2 = Z.median(axis=1)
-    dev2 = Z.sub(med2, axis=0)
-    mad2 = dev2.abs().median(axis=1) * MAD_TO_SIGMA
-    scale2 = mad2.where(mad2 > 0, Z.std(axis=1))
-
-    return dev2.div(scale2.where(scale2 > 0, 1.0), axis=0)
+    # Clip last. Anything applied after this point can push values back over
+    # the bound; see the note in the docstring.
+    return dev.div(scale.where(scale > 0, 1.0), axis=0).clip(-winsor, winsor)
 
 
 # ----------------------------------------------------------------------
 # Assembly onto the rebalance clock
 # ----------------------------------------------------------------------
 def assemble(features: dict[str, pd.DataFrame], dates: pd.DatetimeIndex,
-             winsor: float = 3.0) -> tuple[np.ndarray, list[str], list[str]]:
+             winsor: float = 3.0,
+             exclude: list[str] | None = None,
+             ) -> tuple[np.ndarray, list[str], list[str]]:
     """Standardise, sample on the rebalance clock, and stack into [T, N, F].
 
     Parameters
@@ -429,6 +431,10 @@ def assemble(features: dict[str, pd.DataFrame], dates: pd.DatetimeIndex,
         Rebalance dates; every one must exist on the daily clock.
     winsor : float, default 3.0
         Passed through to `standardise`.
+    exclude : list[str] or None, default None
+        Feature names to drop before stacking. They are still computed and
+        standardised upstream, so the decision stays visible and reversible
+        from config alone.
 
     Returns
     -------
@@ -436,7 +442,21 @@ def assemble(features: dict[str, pd.DataFrame], dates: pd.DatetimeIndex,
         `(X, tickers, feature_names)` with X of shape [T, N, F] and axis order
         (date, ticker, feature).
     """
-    feature_names = list(features)
+    dropped = set(exclude or [])
+    unknown = dropped - set(features)
+    if unknown:
+        raise ValueError(
+            f"features.exclude names {len(unknown)} unknown feature(s): "
+            f"{sorted(unknown)}; known features are {list(features)}"
+        )
+
+    feature_names = [n for n in features if n not in dropped]
+    if dropped:
+        print(f"  excluded {len(dropped)}: {sorted(dropped)}")
+    print(f"  F = {len(feature_names)} features retained")
+    if not feature_names:
+        raise ValueError("features.exclude removed every feature")
+
     first = features[feature_names[0]]
     tickers = list(first.columns)
 
@@ -504,6 +524,7 @@ def main() -> None:
     freq = fcfg.get("rebalance_freq", "ME")
     burn_in = int(fcfg.get("burn_in", TRADING_DAYS))
     winsor = float(fcfg.get("winsor", 3.0))
+    exclude = list(fcfg.get("exclude", []) or [])
 
     proc_dir = Path(cfg["data"]["processed_dir"])
     panel_path = proc_dir / "panel.parquet"
@@ -524,7 +545,8 @@ def main() -> None:
     features = build_features(wide)
 
     print(f"[4] standardising (winsor={winsor}) and sampling")
-    X, tickers, feature_names = assemble(features, dates, winsor=winsor)
+    X, tickers, feature_names = assemble(features, dates, winsor=winsor,
+                                         exclude=exclude)
     print(f"  X.shape = {X.shape}  (dates x tickers x features)")
 
     np.savez_compressed(

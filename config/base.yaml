@@ -24,6 +24,11 @@ features:
   rebalance_freq: "ME"           # node features are sampled month-end
   burn_in: 252                   # sessions dropped so the 252d window is full
   winsor: 3.0                    # cross-sectional clip, in robust sigmas
+  exclude:                       # computed, then dropped in assemble
+    - amihud_63                  # -0.962 with log_adv_63: dollar volume is
+                                 # its denominator, so near-duplicate
+    - zero_ret_frac_63           # 77.6% exactly zero: a near-constant
+                                 # cross-section cannot separate clusters
 
 graph:
   corr_window: 252               # T, from section 1.0
