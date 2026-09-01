@@ -1,0 +1,138 @@
+{
+    "task": "Build src/features/node_features.py — the Phase 2 node-feature module that collapses the daily price panel into a [T, N, F] tensor of cross-sectionally standardised asset descriptors sampled on a monthly rebalance clock.",
+  
+    "context": {
+      "project": "Dynamic equity clustering with temporal GNNs.",
+      "repo_root": "the current working directory; run all commands from here",
+      "input": "data/processed/panel.parquet — long format, columns: date, ticker, open, high, low, close, volume, dollar_volume, log_ret, is_filled. Verified dense: 105 tickers x 2929 sessions, 2015-01-02 to 2026-08-26, zero NaNs in close.",
+      "output": "data/processed/features.npz",
+      "core_idea": "There are two clocks. The DAILY clock carries returns and volumes. The REBALANCE clock (month-end) carries graphs, embeddings and clusters. A node feature is a function collapsing a trailing window of the daily clock into one number, evaluated on the rebalance clock. Compute every feature on the full daily clock first, then sample on rebalance dates. Do not loop over rebalance dates recomputing windows — it is far slower and invites off-by-one alignment bugs.",
+      "design_boundary": "These are NODE features: marginal properties of a single asset. Pairwise quantities (correlation, partial correlation, co-movement) are EDGE features and belong in Phase 3 (src/graphs/). Do not compute any pairwise quantity in this module. beta_252 and idio_vol_252 are the deliberate exception: they are computed against a market aggregate but describe the asset's own character."
+    },
+  
+    "leakage_constraints": {
+      "priority": "These are the highest-priority constraints in this task. A leaked feature produces coherent-looking clusters that are worthless, and unlike a supervised task there is no accuracy metric that will reveal it.",
+      "rules": [
+        "Every rolling window must be right-aligned and backward-looking. X[t] may use data on (-inf, t] only.",
+        "Never pass center=True to any rolling or expanding call.",
+        "Never use a negative shift. shift(-k) is forbidden anywhere in this module.",
+        "Never use bfill, backfill, or interpolate with a method that reads forward.",
+        "Cross-sectional standardisation operates across tickers at a single date (axis=1). It must never operate across time.",
+        "Add a module-level docstring section stating these rules."
+      ]
+    },
+  
+    "functions": [
+      {
+        "name": "to_wide",
+        "signature": "to_wide(panel: pd.DataFrame) -> dict[str, pd.DataFrame]",
+        "spec": "Pivot the long panel into {field: DataFrame indexed by date, columns by ticker} for fields: close, log_ret, dollar_volume. Assert the resulting close frame has no NaNs and raise a clear error naming offending tickers if it does."
+      },
+      {
+        "name": "rebalance_dates",
+        "signature": "rebalance_dates(index: pd.DatetimeIndex, freq: str = 'ME', burn_in: int = 252) -> pd.DatetimeIndex",
+        "leave_as_stub": true,
+        "spec": "LEAVE THIS AS A STUB with the docstring and a TODO comment. The user is writing this one. Do not implement it. The docstring must state: returns the last ACTUAL trading session in each period (not the calendar period-end label, which is frequently a weekend or holiday and would not exist in the index), after dropping the first `burn_in` sessions so the longest trailing window is fully populated."
+      },
+      {
+        "name": "market_beta",
+        "signature": "market_beta(ret: pd.DataFrame, window: int) -> tuple[pd.DataFrame, pd.DataFrame]",
+        "leave_as_stub": true,
+        "spec": "LEAVE THIS AS A STUB with the docstring and a TODO comment. The user is writing this one. The docstring must state: returns (beta, idio_vol) against the equal-weighted cross-sectional mean return; beta computed as rolling cov / rolling var, NOT a per-ticker regression loop; idio_vol is the annualised std of the residual ret - beta * mkt."
+      },
+      {
+        "name": "build_features",
+        "signature": "build_features(wide: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]",
+        "spec": "Compute all fifteen features on the daily clock. Return {feature_name: DataFrame(date x ticker)}. Call market_beta for the two factor features (it will raise NotImplementedError until the user fills it in — that is expected and acceptable)."
+      },
+      {
+        "name": "standardise",
+        "signature": "standardise(X: pd.DataFrame, winsor: float = 3.0) -> pd.DataFrame",
+        "spec": "Robust cross-sectional standardisation at each date (axis=1). Centre on the row median, scale by row MAD * 1.4826 (the Gaussian consistency constant), clip to +/- winsor, then re-centre and re-scale so the output has approximately zero median and unit scale. Use median/MAD rather than mean/std because std is inflated by the very outliers being clipped, so a mean/std clip barely bites. Guard against zero MAD (a degenerate cross-section) by falling back to the row std, and if that is also zero return zeros for that row."
+      },
+      {
+        "name": "assemble",
+        "signature": "assemble(features: dict[str, pd.DataFrame], dates: pd.DatetimeIndex) -> tuple[np.ndarray, list[str], list[str]]",
+        "spec": "Standardise each feature, sample it on the rebalance dates, and stack into X of shape [T, N, F] with axis order (date, ticker, feature). Return (X, tickers, feature_names). Count residual NaNs and print the count per feature BEFORE filling; fill remaining NaNs with 0.0 (which places the asset at the cross-sectional centre) and print the total filled as a fraction of X.size. Assert the final X contains no NaN or inf."
+      },
+      {
+        "name": "feature_correlation",
+        "signature": "feature_correlation(X: np.ndarray, feature_names: list[str]) -> pd.DataFrame",
+        "spec": "Pool across all dates and tickers (reshape to [T*N, F]) and return the F x F Pearson correlation matrix as a labelled DataFrame."
+      },
+      {
+        "name": "main",
+        "spec": "Read config/base.yaml and data/processed/panel.parquet, run the pipeline, save data/processed/features.npz via np.savez_compressed with keys X, tickers, dates (as ISO strings), feature_names. Print: number of rebalance dates, X.shape, first and last rebalance date, per-feature NaN counts before filling, and the ten most correlated feature pairs by absolute correlation."
+      }
+    ],
+  
+    "feature_definitions": {
+      "note": "Fifteen features. All windows in trading days. Annualisation factor TRADING_DAYS = 252. Every rolling call uses min_periods = int(0.8 * window).",
+      "risk": {
+        "vol_21": "rolling 21d std of log_ret, times sqrt(252)",
+        "vol_63": "rolling 63d std of log_ret, times sqrt(252)",
+        "semivol_63": "rolling 63d std computed over negative log returns only (mask positives to NaN first), times sqrt(252)",
+        "volofvol_63": "rolling 63d std of the 21d rolling vol series",
+        "skew_252": "rolling 252d skewness of log_ret",
+        "kurt_252": "rolling 252d excess kurtosis of log_ret (pandas .kurt() is already excess)"
+      },
+      "liquidity": {
+        "log_adv_63": "log of the rolling 63d mean of dollar_volume. The log is mandatory: dollar volume spans orders of magnitude and untransformed it behaves as a single-name outlier detector rather than a feature.",
+        "amihud_63": "build the daily ratio |log_ret| / dollar_volume, take its rolling 63d mean, then take the log. dollar_volume is already NaN where non-positive (handled in clean.py), so no additional zero guard is needed, but assert no inf appears. The log is mandatory: Amihud is severely right-skewed.",
+        "zero_ret_frac_63": "rolling 63d mean of the indicator (abs(log_ret) < 1e-8). A crude but effective illiquidity proxy."
+      },
+      "factor": {
+        "beta_252": "from market_beta(ret, 252)",
+        "idio_vol_252": "from market_beta(ret, 252)"
+      },
+      "trend": {
+        "mom_21": "rolling 21d sum of log_ret",
+        "mom_63": "rolling 63d sum of log_ret",
+        "mom_252_21": "skip-month momentum: rolling 252d sum of log_ret MINUS rolling 21d sum of log_ret. This excludes the most recent month, which is standard because recent-month returns tend to reverse rather than continue.",
+        "dist_52w_high": "log(close / close.rolling(252).max()). Always <= 0."
+      }
+    },
+  
+    "tests": {
+      "file": "tests/test_node_features.py",
+      "framework": "pytest",
+      "constraint": "Use small synthetic DataFrames built inline. Do NOT read data/processed/panel.parquet — a test that reads real data is a description of today's dataset, not a test of the code.",
+      "cases": [
+        "realised_vol: a series of i.i.d. normal returns with known sigma recovers approximately sigma * sqrt(252), within a generous tolerance.",
+        "mom_252_21: on a series with constant daily return r, the value equals exactly 231 * r, confirming the most recent 21 days are excluded.",
+        "standardise: output rows have median approximately 0 and MAD-based scale approximately 1; a row containing one extreme outlier has that outlier clipped to the winsor bound.",
+        "standardise: a row of identical values returns zeros rather than NaN or inf (degenerate cross-section guard).",
+        "dist_52w_high: is always <= 0, and equals 0 exactly on the day a series makes a new rolling maximum.",
+        "no_lookahead: a canary test — build a returns frame, compute vol_63, corrupt the LAST row of returns to an extreme value, recompute, and assert that all feature values strictly before that date are unchanged. This is the single most important test in the file."
+      ]
+    },
+  
+    "constraints": [
+      "Do not modify any file under src/data/ or config/ except to add a 'features' section to config/base.yaml containing: rebalance_freq: 'ME', burn_in: 252, winsor: 3.0.",
+      "Do not add third-party dependencies. numpy, pandas, pyyaml only.",
+      "Preserve the existing code style: from __future__ import annotations, type hints on all signatures, numpy-style docstrings, print-based run logging.",
+      "Leave rebalance_dates and market_beta as stubs raising NotImplementedError with the specified docstrings. Do not implement them.",
+      "Do not create the notebook. The user will write notebooks/02_features.ipynb separately.",
+      "Create src/features/__init__.py if absent."
+    ],
+  
+    "verification": {
+      "steps": [
+        "python -m pytest tests/test_node_features.py -v",
+        "python -c \"import src.features.node_features as nf; print([f for f in dir(nf) if not f.startswith('_')])\""
+      ],
+      "expected": [
+        "All tests pass EXCEPT any that depend on the two stubbed functions, which should be marked with pytest.mark.skip and a reason naming the stub.",
+        "The module imports cleanly.",
+        "python -m src.features.node_features will raise NotImplementedError from rebalance_dates. This is the intended state on delivery."
+      ],
+      "on_mismatch": "Report the discrepancy rather than relaxing a tolerance or weakening a test to make it pass."
+    },
+  
+    "deliverables": [
+      "src/features/node_features.py with two documented stubs",
+      "tests/test_node_features.py",
+      "the features section added to config/base.yaml",
+      "a short summary listing each implemented feature and the exact rolling expression used for it, so the definitions can be checked against the spec by eye"
+    ]
+  }

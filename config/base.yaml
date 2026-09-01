@@ -20,6 +20,11 @@ data:
   pause: 1.0
   end: "2026-08-01"     # pinned for reproducibility; bump deliberately, never implicitly
 
+features:
+  rebalance_freq: "ME"           # node features are sampled month-end
+  burn_in: 252                   # sessions dropped so the 252d window is full
+  winsor: 3.0                    # cross-sectional clip, in robust sigmas
+
 graph:
   corr_window: 252               # T, from section 1.0
   rebalance: "ME"                # month-end
