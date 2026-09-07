@@ -1,0 +1,145 @@
+{
+    "task": "Build src/graphs/construct.py — Phase 3 Part A. Construct a temporal sequence of correlation-based k-nearest-neighbour graphs, one per rebalance date, with market-mode removal and Ledoit-Wolf shrinkage, plus the diagnostics needed to choose k.",
+  
+    "context": {
+      "project": "Dynamic equity clustering with temporal GNNs.",
+      "repo_root": "the current working directory; run all commands from here",
+      "inputs": {
+        "data/processed/panel.parquet": "long format; use columns date, ticker, log_ret. Dense: 105 tickers x 2929 sessions, 2015-01-02 to 2026-08-26.",
+        "data/processed/features.npz": "use ONLY the 'dates' and 'tickers' arrays, to guarantee the graph sequence is aligned to the same rebalance clock and ticker ordering as the feature tensor X. Do not use X itself — node features play no part in edge construction."
+      },
+      "output": "data/processed/graphs.npz",
+      "pipeline": "For each rebalance date t: slice the trailing corr_window sessions ending at t inclusive -> residualise to remove the market mode -> Ledoit-Wolf shrunk correlation -> kNN adjacency -> store.",
+      "design_boundary": "Edges are PAIRWISE quantities. This module must not read the node-feature tensor X. Keeping node and edge information separate is what makes the later 'does the graph add anything over the features alone' comparison meaningful.",
+      "storage_decision": "Store adjacencies DENSE as a float32 array of shape [T, N, N]. At N=105 this is about 5.6 MB total. Do not use scipy.sparse — it adds indexing complexity for no benefit at this size."
+    },
+  
+    "leakage_constraints": {
+      "priority": "Highest priority. A leaked graph produces coherent-looking clusters that are worthless, and there is no accuracy metric to reveal it.",
+      "rules": [
+        "The correlation window for rebalance date t is the corr_window sessions ending at t INCLUSIVE. Data after t must never enter.",
+        "Slice by integer position from the session index, not by date arithmetic, to avoid off-by-one from holidays.",
+        "Residualisation betas must be estimated within the same trailing window, never globally over the full sample.",
+        "Ledoit-Wolf shrinkage intensity must be estimated per window, never fitted once on all data.",
+        "Add a module-level docstring stating these rules."
+      ]
+    },
+  
+    "functions": [
+      {
+        "name": "load_returns",
+        "signature": "load_returns(panel_path: str, tickers: list[str]) -> pd.DataFrame",
+        "spec": "Pivot the long panel to a wide date x ticker frame of log returns, reindexed to the exact ticker order given (which comes from features.npz). Assert no NaNs and assert the column order matches `tickers` exactly — column misalignment between the graph and the feature tensor would be a silent, catastrophic bug."
+      },
+      {
+        "name": "residualise",
+        "signature": "residualise(R: np.ndarray, n_factors: int = 1) -> np.ndarray",
+        "spec": "Remove the top n_factors principal components from a [T_win, N] window of returns. Implement via PCA on the window: centre the columns, take the SVD, project out the leading n_factors components, return the residual matrix of the same shape. For n_factors=1 this removes the market mode — the common-mode component that otherwise connects every asset to every other and produces a hairball graph. Return the residuals; also return nothing else (keep the signature simple)."
+      },
+      {
+        "name": "shrunk_correlation",
+        "signature": "shrunk_correlation(R: np.ndarray, method: str = 'ledoit_wolf') -> tuple[np.ndarray, float]",
+        "spec": "Estimate an N x N correlation matrix from a [T_win, N] return window. For method='ledoit_wolf', use sklearn.covariance.LedoitWolf to obtain the shrunk covariance, then convert to correlation by dividing by the outer product of the square-rooted diagonal. Return (C, shrinkage_intensity). For method='sample', return the plain sample correlation with intensity 0.0. Assert the result is symmetric with a unit diagonal. Rationale to put in the docstring: at q = N/T = 105/252 = 0.42 the sample correlation eigenvalues are badly biased; Marchenko-Pastur places the pure-noise upper edge at (1+sqrt(q))^2 = 2.75, and shrinkage deflates the noise eigenvalues while leaving the large structural ones roughly intact."
+      },
+      {
+        "name": "knn_adjacency",
+        "signature": "knn_adjacency(S: np.ndarray, k: int, symmetrise: str = 'union', weighted: bool = True) -> np.ndarray",
+        "spec": "Build the kNN adjacency from an N x N similarity matrix S. Set the diagonal to -inf so no node selects itself. For each row i, take the k largest entries as neighbours, giving a DIRECTED indicator. Then symmetrise: 'union' takes the elementwise maximum of the directed matrix and its transpose; 'intersection' takes the elementwise minimum. If weighted, multiply the resulting binary mask by S; otherwise return the binary mask. Diagonal must be exactly zero in the output. Docstring must state: the directed kNN relation is not symmetric because a hub asset appears in many neighbourhoods while a peripheral one appears in few, and union is the default because intersection routinely disconnects peripheral nodes — an isolated node receives no messages and its GNN embedding is meaningless."
+      },
+      {
+        "name": "build_graph_sequence",
+        "signature": "build_graph_sequence(ret: pd.DataFrame, dates: pd.DatetimeIndex, cfg: dict, k: int) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]",
+        "spec": "Loop over rebalance dates. For each: locate the date's integer position in ret.index, slice the trailing corr_window rows ending at that position inclusive, residualise, compute the shrunk correlation, build the kNN adjacency. Return (A_weighted of shape [T, N, N] float32, C_stack of shape [T, N, N] float32 holding the correlation matrices, meta DataFrame indexed by date with columns: shrinkage, mean_corr, top_eigval_frac, n_eigs_above_mp). Store the correlation matrices because Part B needs them for the Gaussian-benchmark comparison and recomputing would be wasteful."
+      },
+      {
+        "name": "marchenko_pastur_edge",
+        "signature": "marchenko_pastur_edge(n: int, t: int) -> float",
+        "spec": "Return the Marchenko-Pastur upper edge (1 + sqrt(q))^2 where q = n/t. Used to count how many eigenvalues clear the noise floor."
+      },
+      {
+        "name": "edge_persistence",
+        "signature": "edge_persistence(A1: np.ndarray, A2: np.ndarray) -> float",
+        "spec": "Jaccard overlap between two adjacency matrices' edge sets: |E1 intersect E2| / |E1 union E2|, computed on the binarised upper triangle. Return 0.0 if the union is empty. Docstring must state the interpretation: near 0 means the graph is noise and clusters will be unstable; near 1 means the graph is not dynamic and the premise of the study collapses; roughly 0.6 to 0.85 indicates structure that evolves. Also note the honest caveat that consecutive 252-day windows share about 92% of their observations, so high persistence is partly mechanical."
+      },
+      {
+        "name": "graph_diagnostics",
+        "signature": "graph_diagnostics(A: np.ndarray) -> pd.DataFrame",
+        "spec": "Per date, compute: n_edges, density, mean_degree, min_degree, max_degree, degree_gini (inequality of the degree distribution), n_components (via scipy.sparse.csgraph.connected_components on the binarised matrix), and is_connected. Return a DataFrame with one row per date."
+      },
+      {
+        "name": "sweep_k",
+        "signature": "sweep_k(ret: pd.DataFrame, dates: pd.DatetimeIndex, cfg: dict, k_values: list[int]) -> pd.DataFrame",
+        "spec": "For each k, build the sequence and return a summary row: k, mean_degree, density, frac_dates_connected, mean_persistence, std_persistence. This table is the basis for choosing k and must be printed at the end of the run."
+      },
+      {
+        "name": "main",
+        "spec": "Read config, load returns aligned to the features tickers, run sweep_k over cfg['graph']['k_sweep'], print the sweep table, then build the final sequence at cfg['graph']['k'] and save data/processed/graphs.npz via np.savez_compressed with keys: A (weighted adjacency [T,N,N] float32), A_binary (uint8), C (correlation matrices [T,N,N] float32), dates (ISO strings), tickers, and config_json (a JSON string of the graph config, so the artifact records how it was built). Print: the sweep table, the chosen k, mean and range of degree, fraction of dates connected, mean persistence, mean shrinkage intensity, and the mean number of eigenvalues above the Marchenko-Pastur edge."
+      }
+    ],
+  
+    "config_additions": {
+      "file": "config/base.yaml",
+      "under_key": "graph",
+      "keys": {
+        "corr_window": 252,
+        "n_factors": 1,
+        "shrinkage": "ledoit_wolf",
+        "similarity": "signed",
+        "k": 10,
+        "k_sweep": [5, 7, 10, 15, 20],
+        "symmetrise": "union",
+        "weighted": true
+      },
+      "note": "similarity: 'signed' uses the raw correlation, so an edge means co-movement in the SAME direction. 'absolute' would use |rho|, which makes hedges into neighbours. Signed is the default because two stocks at rho = -0.8 are opposites, not peers, and grouping them destroys the structure the clustering is meant to find. Add this as a YAML comment."
+    },
+  
+    "tests": {
+      "file": "tests/test_construct.py",
+      "framework": "pytest",
+      "constraint": "Synthetic data built inline. Do NOT read data/processed/*.",
+      "cases": [
+        "knn_adjacency: on a small hand-built similarity matrix with known ordering, the correct neighbours are selected.",
+        "knn_adjacency: output is exactly symmetric, and the diagonal is exactly zero.",
+        "knn_adjacency: under union symmetrisation every node has degree >= k.",
+        "knn_adjacency: under intersection symmetrisation every node has degree <= k.",
+        "residualise: build returns as a common factor plus small idiosyncratic noise; after residualise with n_factors=1, the mean absolute off-diagonal correlation of the residuals is substantially lower than before. This is the market-mode-removal property.",
+        "shrunk_correlation: output is symmetric, has a unit diagonal, and is positive semi-definite (all eigenvalues >= -1e-8). Shrinkage intensity lies in [0, 1].",
+        "edge_persistence: identical graphs give exactly 1.0; edge-disjoint graphs give exactly 0.0; a graph sharing half its edges gives approximately 1/3 (check the Jaccard arithmetic rather than assuming 0.5).",
+        "marchenko_pastur_edge: at q=1 returns 4.0; at q=0.42 returns approximately 2.75.",
+        "no_lookahead: THE MOST IMPORTANT TEST. Build a returns frame and a rebalance date t partway through. Compute the graph at t. Then corrupt every return AFTER t to extreme values, recompute, and assert the graph at t is bitwise identical."
+      ]
+    },
+  
+    "constraints": [
+      "Do not modify anything under src/data/ or src/features/.",
+      "Dependencies: numpy, pandas, scipy, scikit-learn, pyyaml. No others.",
+      "Preserve the existing style: from __future__ import annotations, type hints on all signatures, numpy-style docstrings, print-based run logging.",
+      "Do not implement mutual information, partial correlation, MST, or threshold graphs. Part A is correlation kNN only.",
+      "Do not create the notebook; the user will write notebooks/03_graphs.ipynb separately.",
+      "Create src/graphs/__init__.py if absent."
+    ],
+  
+    "verification": {
+      "steps": [
+        "python -m pytest tests/test_construct.py -v",
+        "python -m src.graphs.construct"
+      ],
+      "expected": [
+        "All tests pass.",
+        "A.shape == (128, 105, 105); the ticker order matches features.npz exactly.",
+        "Every adjacency is symmetric with a zero diagonal.",
+        "Mean degree lies between k and 2k under union symmetrisation.",
+        "Mean edge persistence falls somewhere in 0.5 to 0.9.",
+        "Ledoit-Wolf shrinkage intensity is strictly positive at every date."
+      ],
+      "on_mismatch": "Report the actual numbers. Do not tune k, the window, or any threshold to make the expected ranges hold — those ranges are predictions under test, not targets."
+    },
+  
+    "deliverables": [
+      "src/graphs/construct.py",
+      "tests/test_construct.py",
+      "the graph section added to config/base.yaml",
+      "the printed k-sweep table",
+      "a one-line summary per diagnostic: mean degree, connectivity fraction, mean persistence, mean shrinkage intensity, mean eigenvalues above the Marchenko-Pastur edge"
+    ]
+  }

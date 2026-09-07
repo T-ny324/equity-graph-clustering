@@ -33,3 +33,14 @@ features:
 graph:
   corr_window: 252               # T, from section 1.0
   rebalance: "ME"                # month-end
+  n_factors: 1                   # PCs removed per window; 1 = the market mode
+  shrinkage: ledoit_wolf         # intensity re-estimated on every window
+  # signed uses the raw correlation, so an edge means co-movement in the SAME
+  # direction. absolute would use |rho|, which makes hedges into neighbours:
+  # two stocks at rho = -0.8 are opposites, not peers, and grouping them
+  # destroys the very structure the clustering is meant to find.
+  similarity: signed
+  k: 10                          # neighbours per node, before symmetrisation
+  k_sweep: [5, 7, 10, 15, 20]
+  symmetrise: union              # max(D, D.T); intersection isolates periphery
+  weighted: true                 # multiply the mask by the correlation
