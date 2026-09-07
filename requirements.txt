@@ -1,0 +1,32 @@
+# Pinned environment for equity-graph-clustering.
+#
+# Built and verified on Python 3.14.6 (darwin/arm64).
+# Pins are exact on purpose: bump them deliberately, never implicitly — the
+# same rule config/base.yaml applies to data.end.
+#
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements.txt
+#
+# Every entry below is imported by src/, tests/ or notebooks/, or is required
+# at runtime by something that is.
+
+# --- core pipeline (src/data, src/features, src/graphs) ----------------
+numpy==2.5.2
+pandas==3.0.5
+PyYAML==6.0.3
+pyarrow==25.0.1          # pandas parquet engine for data/processed/*.parquet
+
+# --- Phase 1: ingest ---------------------------------------------------
+yfinance==1.6.0          # src/data/ingest.py only
+
+# --- Phase 3: graphs ---------------------------------------------------
+scipy==1.18.1            # sparse.csgraph.connected_components
+scikit-learn==1.9.0      # covariance.LedoitWolf
+
+# --- tests -------------------------------------------------------------
+pytest==9.1.1
+
+# --- notebooks ---------------------------------------------------------
+matplotlib==3.11.1
+jupyter==1.1.1           # metapackage: notebook, ipykernel, jupyterlab
+nbconvert==7.17.1        # `jupyter nbconvert --execute`, used to run 02_features
