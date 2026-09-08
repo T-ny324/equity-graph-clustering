@@ -28,5 +28,6 @@ pytest==9.1.1
 
 # --- notebooks ---------------------------------------------------------
 matplotlib==3.11.1
+networkx==3.6.1          # notebooks/03_graphs.ipynb graph drawing
 jupyter==1.1.1           # metapackage: notebook, ipykernel, jupyterlab
 nbconvert==7.17.1        # `jupyter nbconvert --execute`, used to run 02_features
