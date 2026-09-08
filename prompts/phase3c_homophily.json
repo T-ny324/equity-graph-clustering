@@ -1,0 +1,99 @@
+{
+    "task": "Build src/graphs/homophily.py — graph homophily and feature-smoothness diagnostics for the Phase 3 correlation and mutual-information graphs.",
+  
+    "context": {
+      "project": "Dynamic equity clustering with temporal GNNs.",
+      "repo_root": "the current working directory; run all commands from here",
+      "purpose": "These metrics determine the Phase 4 architecture choice. Standard message passing (GCN, GraphSAGE) averages over neighbourhoods, which concentrates signal only when neighbours are similar. On a heterophilous graph, averaging destroys signal rather than sharpening it, and a heterophily-aware architecture is required instead. This module measures the property before the architecture is chosen.",
+      "inputs": {
+        "data/processed/graphs.npz": "Part A correlation graphs. Keys: A [T,N,N], dates, tickers.",
+        "data/processed/graphs_mi.npz": "Part B mutual-information graphs. Key: A [T',N,N]. T' may differ from T if the MI run used subsample_dates.",
+        "data/processed/features.npz": "Keys X [T,N,F], tickers, feature_names, dates.",
+        "data/universe_sp100.csv": "Columns include yahoo_ticker and sector."
+      },
+      "output": "data/processed/homophily.csv"
+    },
+  
+    "functions": [
+      {
+        "name": "load_sector_labels",
+        "signature": "load_sector_labels(universe_csv: str | Path, tickers: list[str]) -> np.ndarray",
+        "spec": "Return GICS sector labels reindexed to the exact order of `tickers`. ASSERT there are no NaNs, and name every offending ticker in the AssertionError message. Docstring must state why this fails loudly rather than warning: a missing sector label does not crash anything downstream, it silently counts as 'different sector' for every edge touching that node and biases homophily downward. This exact failure has already occurred once in this project via the renamed tickers BNY and FISV."
+      },
+      {
+        "name": "edge_homophily",
+        "signature": "edge_homophily(A: np.ndarray, labels: np.ndarray) -> dict",
+        "spec": "Binarise A and take the upper triangle. Return a dict with three keys: 'raw' — the fraction of edges joining same-label nodes; 'expected' — the sum of squared class proportions, which is the value under random mixing; 'adjusted' — (raw - expected) / (1 - expected). Docstring must state that 'expected' is NOT 1/n_classes when classes are unequal in size, which is why the raw figure alone is uninterpretable, and that 'adjusted' is the figure to quote: 0 means random mixing, 1 means perfect homophily, negative means heterophily."
+      },
+      {
+        "name": "assortativity",
+        "signature": "assortativity(A: np.ndarray, labels: np.ndarray) -> float",
+        "spec": "Newman's attribute assortativity coefficient, via networkx.attribute_assortativity_coefficient on the binarised graph with labels set as a node attribute. Docstring must note that it handles class imbalance differently from edge_homophily, so both are reported rather than one substituting for the other."
+      },
+      {
+        "name": "feature_smoothness",
+        "signature": "feature_smoothness(A: np.ndarray, X_t: np.ndarray) -> float",
+        "spec": "Mean squared feature distance across connected pairs, divided by the mean squared feature distance across all pairs. This is a normalised Dirichlet energy over the graph. Docstring must state that this is the metric that matters most for Phase 4, because the GNN consumes X rather than sector labels: a value well below 1 means connected nodes are closer in feature space than random pairs, so neighbourhood averaging concentrates signal; a value near or above 1 means smoothing would blur rather than sharpen, and a vanilla GCN is the wrong architecture."
+      },
+      {
+        "name": "per_feature_smoothness",
+        "signature": "per_feature_smoothness(A: np.ndarray, X_t: np.ndarray, feature_names: list[str]) -> pd.Series",
+        "spec": "feature_smoothness computed one feature at a time, returned as a Series indexed by feature name. Docstring must state why this is more informative than the aggregate: some features may be smooth over the graph while others are not, and knowing which is a sharper claim about what information the graph carries than any single averaged number."
+      },
+      {
+        "name": "analyse",
+        "signature": "analyse(A_stack: np.ndarray, X: np.ndarray, labels: np.ndarray, dates: pd.DatetimeIndex, feature_names: list[str], name: str) -> tuple[pd.DataFrame, pd.Series]",
+        "spec": "Run all metrics for every date in the stack. Return (per_date DataFrame indexed by date with columns homophily_raw, homophily_expected, homophily_adjusted, assortativity, smoothness, and a 'graph' column set to `name`; and a Series of per-feature smoothness averaged across dates)."
+      },
+      {
+        "name": "main",
+        "spec": "Load both graph stacks, the feature tensor, and the sector labels. CRITICAL: align the two graph stacks on their common dates before comparing, because the MI run may have used subsample_dates and therefore cover a different set — assert the ticker orders of graphs.npz, graphs_mi.npz and features.npz are all identical before proceeding. Run analyse for each graph on the aligned dates. Print a side-by-side summary table of the means for both graphs. Print the per-feature smoothness for the correlation graph sorted ascending. Save the concatenated per-date results to data/processed/homophily.csv."
+      }
+    ],
+  
+    "tests": {
+      "file": "tests/test_homophily.py",
+      "framework": "pytest",
+      "constraint": "Synthetic data built inline. Do NOT read data/processed/*.",
+      "cases": [
+        "edge_homophily: a graph whose edges all join same-label nodes gives adjusted == 1.0.",
+        "edge_homophily: a graph whose edges all join different-label nodes gives adjusted < 0.",
+        "edge_homophily: with two equal-sized classes wired at random, 'expected' == 0.5 and 'adjusted' is close to 0.",
+        "edge_homophily: with unequal class sizes, 'expected' equals the sum of squared proportions and is NOT 1/n_classes.",
+        "feature_smoothness: construct X so connected nodes have near-identical features and unconnected nodes differ substantially; assert the result is well below 1. Then invert the construction and assert the result exceeds 1.",
+        "load_sector_labels: raises an AssertionError naming the specific ticker when a sector is missing.",
+        "assortativity: returns approximately 1.0 on a perfectly homophilous graph."
+      ]
+    },
+  
+    "constraints": [
+      "Do not modify src/graphs/construct.py, src/graphs/mutual_info.py, src/features/node_features.py, or anything under src/data/.",
+      "Dependencies: numpy, pandas, networkx, pyyaml. No others.",
+      "Preserve the existing style: from __future__ import annotations, type hints on all signatures, numpy-style docstrings, print-based run logging.",
+      "Do not create a notebook.",
+      "Do not implement any GNN architecture, clustering, or Phase 4 work. This module measures graph properties only."
+    ],
+  
+    "verification": {
+      "steps": [
+        "python -m pytest tests/test_homophily.py -v",
+        "python -m src.graphs.homophily"
+      ],
+      "expected": [
+        "All tests pass.",
+        "The sector-label assertion passes, confirming no NaN labels remain after the BNY and FISV fix.",
+        "Both graphs report an adjusted homophily above 0, indicating some sector structure.",
+        "The correlation graph's adjusted homophily exceeds the MI graph's, consistent with the persistence gap of 0.746 against 0.458."
+      ],
+      "on_mismatch": "Report the actual numbers. Do not adjust any metric definition, binarisation threshold, or date alignment to make the correlation graph look better than the mutual-information graph. The comparison is the point and either outcome is a legitimate result."
+    },
+  
+    "deliverables": [
+      "src/graphs/homophily.py",
+      "tests/test_homophily.py",
+      "data/processed/homophily.csv",
+      "the printed side-by-side summary table for both graphs",
+      "the printed per-feature smoothness ranking for the correlation graph"
+    ]
+  }
+  
