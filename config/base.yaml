@@ -13,7 +13,6 @@ universe:
 
 data:
   start: "2015-01-01"
-  end: null                      # null = today
   raw_dir: data/raw
   processed_dir: data/processed
   batch_size: 25
