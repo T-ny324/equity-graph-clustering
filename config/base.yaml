@@ -44,3 +44,20 @@ graph:
   k_sweep: [5, 7, 10, 15, 20]
   symmetrise: union              # max(D, D.T); intersection isolates periphery
   weighted: true                 # multiply the mask by the correlation
+
+mi:
+  estimator: ksg                 # KSG avoids binning; see B.6 of the maths ref
+  n_neighbors: 4                 # KSG kappa: small = less bias, more variance
+  bins: 6                        # binned estimator + marginal entropies only
+  bin_scheme: quantile           # equal-frequency: returns are heavy-tailed
+  # MI depends on rho^2, so rho = +0.9 and rho = -0.9 are identical (0.83
+  # nats). Unsigned, the graph wires an asset to its strongest HEDGE as
+  # readily as to its closest peer. signed: true masks MI by sign(rho) and
+  # keeps only positive entries, so an edge means same-direction dependence.
+  signed: true
+  n_perm: 100                    # permutations per pair for the null floor
+  # Evenly spaced subset, so a first run costs minutes rather than hours.
+  # Set to null for the full 128-date run once the timing probe has confirmed
+  # the cost is acceptable.
+  subsample_dates: null          # full 128-date run
+  cache_dir: data/processed/_mi_cache

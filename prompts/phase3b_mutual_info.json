@@ -1,0 +1,165 @@
+{
+    "task": "Build src/graphs/mutual_info.py — Phase 3 Part B. Construct mutual-information-based kNN graphs as a controlled alternative to the correlation graphs from Part A, with estimator validation against the Gaussian benchmark, a permutation-based noise floor, and a direct measurement of what MI adds beyond correlation.",
+  
+    "context": {
+      "project": "Dynamic equity clustering with temporal GNNs.",
+      "repo_root": "the current working directory; run all commands from here",
+      "inputs": {
+        "data/processed/panel.parquet": "long format; columns date, ticker, log_ret. 105 tickers x 2929 sessions.",
+        "data/processed/graphs.npz": "from Part A. Use keys 'C' (shrunk correlation matrices, [T,N,N]), 'dates', 'tickers'. The correlation matrices are REUSED, not recomputed — they are needed for the Gaussian benchmark and for the nonlinear-excess measurement."
+      },
+      "output": "data/processed/graphs_mi.npz",
+      "experimental_design": "This is a CONTROLLED comparison. The graph topology (kNN, same k, same union symmetrisation) is held fixed and only the similarity measure changes: Pearson correlation in Part A, mutual information here. Any difference in results is then attributable to the similarity measure alone. To guarantee this, IMPORT residualise and knn_adjacency from src.graphs.construct — do NOT reimplement either. Reimplementation would silently break the control.",
+      "reference": "docs/phase3_maths_reference.md contains the full derivations. Equation numbers below refer to Saha, Gao & Gerlach (2022)."
+    },
+  
+    "key_facts": {
+      "gaussian_identity": "For a bivariate Gaussian pair with correlation rho, MI = -0.5 * ln(1 - rho^2) exactly, in nats. This is the single most important fact in the module: it is both the estimator unit test and the definition of what MI adds beyond correlation.",
+      "mi_is_unsigned": "MI depends on rho^2, so rho = +0.9 and rho = -0.9 give identical MI (0.830 nats). An unsigned MI-kNN graph therefore connects assets to their strongest HEDGES as readily as to their closest peers, which is a substantive defect for equity clustering. Both a signed and an unsigned variant must be built so the effect can be measured.",
+      "mi_noise_is_one_sided": "MI is non-negative, so sampling error cannot cancel: independent series yield MI_hat > 0. Correlation needs no null model because its errors are signed and average out; MI does. This is the biggest practical difference between the two branches.",
+      "sample_size": "T = 252. With b bins the joint histogram has b^2 cells. At b=5 that is about 10 samples per cell; at b=10 about 2.5; at b=16 under 1. Below roughly 5 samples per cell the estimate is dominated by noise.",
+      "compute_scale": "There are 5460 unordered pairs per date and 128 dates, so 698,880 MI estimates for a full run. Correlation is a single matrix multiply; this is not."
+    },
+  
+    "functions": [
+      {
+        "name": "gaussian_mi",
+        "signature": "gaussian_mi(rho: np.ndarray | float) -> np.ndarray | float",
+        "spec": "Return -0.5 * log(1 - rho**2) in nats, elementwise, clipping |rho| to at most 1 - 1e-12 to avoid overflow at the endpoints. Works on scalars and on full matrices."
+      },
+      {
+        "name": "mi_binned",
+        "signature": "mi_binned(x: np.ndarray, y: np.ndarray, bins: int = 6, scheme: str = 'quantile', correct_bias: bool = True) -> float",
+        "spec": "Plug-in MI estimator. Discretise x and y into `bins` bins, form the joint histogram, and compute sum over cells of p_xy * log(p_xy / (p_x * p_y)) in nats, skipping empty cells. For scheme='quantile' use equal-frequency bins via np.quantile; for 'uniform' use equal-width. If correct_bias, subtract the Miller-Madow term (bx - 1) * (by - 1) / (2 * T) where bx and by are the counts of NON-EMPTY marginal bins. Clip the result at 0 from below. Docstring must state why quantile binning is the default: returns are heavy-tailed, so equal-width bins place nearly all mass in the central bins and leave the tails almost empty, which is the opposite of what is wanted."
+      },
+      {
+        "name": "mi_ksg",
+        "signature": "mi_ksg(x: np.ndarray, y: np.ndarray, n_neighbors: int = 4) -> float",
+        "spec": "Kraskov-Stogbauer-Grassberger estimator via sklearn.feature_selection.mutual_info_regression, called with discrete_features=False, n_neighbors=n_neighbors and a fixed random_state for reproducibility. Returns nats. Docstring must state that KSG avoids binning by using k-nearest-neighbour distances in the joint space, adapting resolution to local density, and is therefore far less biased than binning at T = 252."
+      },
+      {
+        "name": "mi_matrix",
+        "signature": "mi_matrix(R: np.ndarray, estimator: str = 'ksg', n_jobs: int = -1, **kwargs) -> np.ndarray",
+        "spec": "Compute the full N x N MI matrix for a [T_win, N] return window. Iterate over the upper triangle only (N*(N-1)/2 pairs) and mirror, since MI is symmetric. Set the diagonal to the marginal entropy estimate, or to 0.0 — either is fine, but state which in the docstring and be consistent, because the diagonal is masked out by knn_adjacency anyway. Parallelise the pair loop with joblib.Parallel over n_jobs. Dispatch to mi_binned or mi_ksg on `estimator`."
+      },
+      {
+        "name": "marginal_entropies",
+        "signature": "marginal_entropies(R: np.ndarray, bins: int = 6) -> np.ndarray",
+        "spec": "Per-asset Shannon entropy of the binned return series, length N, in nats. Needed for normalisation."
+      },
+      {
+        "name": "normalise_mi",
+        "signature": "normalise_mi(M: np.ndarray, H: np.ndarray) -> np.ndarray",
+        "spec": "Return NMI_ij = M_ij / sqrt(H_i * H_j), clipped to [0, 1]. Docstring must state why this matters here: raw MI scales with marginal entropy, so a high-entropy (volatile) asset shows large MI with everything, which would let volatility leak into the neighbour ranking — and volatility is already a node feature."
+      },
+      {
+        "name": "validate_estimator",
+        "signature": "validate_estimator(rhos: list[float], T: int = 252, n_trials: int = 20, estimators: tuple = ('binned', 'ksg')) -> pd.DataFrame",
+        "spec": "THE ESTIMATOR UNIT TEST, run as a reported diagnostic rather than only as a pytest case. For each rho, draw n_trials bivariate Gaussian samples of length T with that correlation, estimate MI with each estimator, and compare against gaussian_mi(rho). Return a DataFrame with columns: rho, mi_true, and per estimator the mean estimate, its standard deviation, and the bias (mean estimate minus truth). Print this table in main(). If an estimator cannot reproduce this curve, no downstream MI number is interpretable."
+      },
+      {
+        "name": "mi_null_floor",
+        "signature": "mi_null_floor(R: np.ndarray, estimator: str = 'ksg', n_perm: int = 100, n_pairs: int = 200, seed: int = 0, **kwargs) -> dict",
+        "spec": "Estimate the MI noise floor by permutation. Sample n_pairs random asset pairs from the window; for each, shuffle one series to destroy any dependence while preserving the marginal distribution, and estimate MI. Repeat to n_perm draws. Return a dict with mean, std, and the 95th and 99th percentiles of the null distribution. Docstring must state that this exists because MI is non-negative, so sampling error has nowhere to cancel and independent series still produce MI_hat > 0; the 95th percentile is the threshold below which an observed MI is indistinguishable from noise."
+      },
+      {
+        "name": "nonlinear_excess",
+        "signature": "nonlinear_excess(M: np.ndarray, C: np.ndarray) -> np.ndarray",
+        "spec": "Return Delta = M - gaussian_mi(C), elementwise. Docstring must state the interpretation plainly: Delta is the dependence NOT explained by linear correlation, in nats. If Delta is approximately zero across the universe, mutual information is reproducing the correlation graph at far greater cost, and that is a legitimate and reportable finding rather than a failure."
+      },
+      {
+        "name": "timing_probe",
+        "signature": "timing_probe(R: np.ndarray, estimator: str, n_pairs: int = 200, **kwargs) -> dict",
+        "spec": "Time n_pairs MI estimates and extrapolate. Return a dict with seconds_per_pair, estimated seconds for one full N x N matrix, and estimated seconds for the full sequence of len(dates) matrices. Print this BEFORE any full run so the compute cost is known in advance rather than discovered."
+      },
+      {
+        "name": "build_mi_graph_sequence",
+        "signature": "build_mi_graph_sequence(ret: pd.DataFrame, dates: pd.DatetimeIndex, C_stack: np.ndarray, cfg: dict, k: int, estimator: str, signed: bool, cache_dir: Path | None = None) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]",
+        "spec": "Loop over rebalance dates. For each: locate the date's integer position in ret.index, slice the trailing corr_window rows ending at that position INCLUSIVE, residualise with src.graphs.construct.residualise using cfg['graph']['n_factors'], compute the MI matrix, normalise it by the marginal entropies. If signed, form S = sign(C[t]) * NMI and set negative entries to 0 so only same-direction dependence can form an edge; if not signed, S = NMI. Build the adjacency by calling src.graphs.construct.knn_adjacency(S, k, symmetrise, weighted). Return (A of shape [T,N,N] float32, M_stack of the raw MI matrices [T,N,N] float32, meta DataFrame indexed by date with columns: mean_mi, mean_nmi, mean_delta, frac_above_null). If cache_dir is given, write each date's MI matrix to cache_dir/mi_{estimator}_{date}.npy and reuse it on a rerun — a full run is long enough that a crash must not cost the whole thing."
+      },
+      {
+        "name": "compare_graphs",
+        "signature": "compare_graphs(A_corr: np.ndarray, A_mi: np.ndarray) -> pd.DataFrame",
+        "spec": "Per date, compute the Jaccard overlap between the correlation-kNN and MI-kNN edge sets, plus each graph's own edge persistence against its previous date. Return a DataFrame indexed by date with columns: edge_jaccard, persistence_corr, persistence_mi. Docstring must state: high edge_jaccard means MI is recovering the correlation graph and the extra cost buys nothing; and because MI noise is one-sided, its persistence may well be LOWER than correlation's."
+      },
+      {
+        "name": "main",
+        "spec": "Order of operations matters and must be followed: (1) load returns aligned to the tickers from graphs.npz and assert the order matches; (2) run validate_estimator and print the table; (3) run mi_null_floor on one mid-sample window and print it; (4) run timing_probe for the configured estimator and print the projected full-run cost; (5) if cfg['mi']['subsample_dates'] is set, build the sequence on that many evenly spaced dates only, otherwise build the full sequence; (6) run compare_graphs against A from graphs.npz, restricted to the same dates; (7) save data/processed/graphs_mi.npz via np.savez_compressed with keys A, A_binary, M (raw MI), Delta (nonlinear excess), dates, tickers, config_json. Print a final summary: mean NMI, mean Delta, fraction of pairs above the null 95th percentile, mean edge Jaccard against the correlation graph, and mean persistence for both graphs."
+      }
+    ],
+  
+    "config_additions": {
+      "file": "config/base.yaml",
+      "under_key": "mi",
+      "keys": {
+        "estimator": "ksg",
+        "n_neighbors": 4,
+        "bins": 6,
+        "bin_scheme": "quantile",
+        "signed": true,
+        "n_perm": 100,
+        "subsample_dates": 12,
+        "cache_dir": "data/processed/_mi_cache"
+      },
+      "note": "Add YAML comments: `signed: true` masks MI by sign(rho) and keeps only positive entries, because MI depends on rho^2 and would otherwise treat hedges as peers. `subsample_dates: 12` runs an evenly spaced subset first; set to null for the full 128-date run once the timing probe has confirmed the cost is acceptable."
+    },
+  
+    "leakage_constraints": {
+      "rules": [
+        "The window for rebalance date t is the corr_window sessions ending at t INCLUSIVE. Slice by integer position, never by date arithmetic.",
+        "Residualisation is performed within each window, never globally.",
+        "Bin edges for the binned estimator must be computed from the window only.",
+        "Never use a negative shift, bfill, or center=True anywhere in this module."
+      ]
+    },
+  
+    "tests": {
+      "file": "tests/test_mutual_info.py",
+      "framework": "pytest",
+      "constraint": "Synthetic data built inline. Do NOT read data/processed/*.",
+      "cases": [
+        "gaussian_mi: returns exactly 0.0 at rho=0, and approximately 0.8305 at rho=0.9.",
+        "GAUSSIAN RECOVERY, the most important test: for rho in {0.0, 0.3, 0.6, 0.9} with T=2000 samples, both mi_binned and mi_ksg recover gaussian_mi(rho) within a generous tolerance. Use T=2000 rather than 252 so the test isolates estimator correctness from small-sample bias.",
+        "mi_ksg and mi_binned: output is non-negative and symmetric in its arguments, MI(x,y) == MI(y,x).",
+        "independence: for two independent standard normal series of length 252, the estimate is small — assert it is below 0.15 nats. This documents that the floor is NOT zero at realistic sample sizes.",
+        "monotone invariance: mi_binned with quantile bins is unchanged (to within a small tolerance) when y is replaced by exp(y), because quantile binning depends only on ranks.",
+        "normalise_mi: output lies in [0, 1] and is symmetric.",
+        "nonlinear_excess: on a jointly Gaussian sample with T large, Delta is approximately 0; on y = x**2 with x symmetric, rho is near 0 while MI is clearly positive, so Delta is clearly positive. This is the test that demonstrates MI is capturing something correlation cannot.",
+        "mi_matrix: returns a symmetric N x N array with the correct shape.",
+        "no_lookahead: build a returns frame and a date t partway through, compute the MI matrix for the window ending at t, then corrupt all returns after t to extreme values and recompute; assert the result is unchanged."
+      ]
+    },
+  
+    "constraints": [
+      "Do not modify src/graphs/construct.py, src/data/, or src/features/. Import from construct.py, never copy from it.",
+      "Dependencies: numpy, pandas, scipy, scikit-learn, joblib, pyyaml. No others.",
+      "Do not implement conditional mutual information, partial mutual information, or the path-consistency algorithm. Equation (17) requires a three-dimensional joint histogram with b^3 cells against 252 observations — roughly two samples per cell at b=5 — so the estimate would be noise. This exclusion is deliberate and should be noted in the module docstring.",
+      "Preserve the existing style: from __future__ import annotations, type hints on all signatures, numpy-style docstrings, print-based run logging.",
+      "Do not create the notebook."
+    ],
+  
+    "verification": {
+      "steps": [
+        "python -m pytest tests/test_mutual_info.py -v",
+        "python -m src.graphs.mutual_info"
+      ],
+      "expected": [
+        "All tests pass.",
+        "The validate_estimator table shows KSG bias smaller than binned bias at every rho.",
+        "The null floor is strictly greater than zero — this is the expected behaviour, not a bug.",
+        "The timing probe prints a projected full-run cost before any long computation begins.",
+        "With subsample_dates set, the run completes in minutes.",
+        "A.shape == (n_dates, 105, 105); ticker order matches graphs.npz exactly."
+      ],
+      "on_mismatch": "Report actual numbers. Do not widen tolerances or change estimator parameters to force agreement. If the estimators fail to recover the Gaussian curve, that is a real bug and must be fixed rather than accommodated."
+    },
+  
+    "deliverables": [
+      "src/graphs/mutual_info.py",
+      "tests/test_mutual_info.py",
+      "the mi section added to config/base.yaml",
+      "the printed validate_estimator table",
+      "the printed null-floor statistics and timing projection",
+      "a one-line summary: mean NMI, mean Delta, fraction of pairs above the null 95th percentile, mean edge Jaccard against the correlation graph"
+    ]
+  }
