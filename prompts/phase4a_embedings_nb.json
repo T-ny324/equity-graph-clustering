@@ -1,0 +1,89 @@
+{
+    "task": "Restructure notebooks/04_embeddings.ipynb into a clean, documented Phase 4 notebook, and add two missing visual sections: the singular-value spectrum with its spectral entropy, and an untrained baseline embedding-space plot coloured by sector.",
+  
+    "context": {
+      "project": "Dynamic equity clustering with temporal GNNs.",
+      "repo_root": "the current working directory",
+      "phase": "Phase 4 — the GCN encoder. src/models/layers.py (GraphConv, normalise_adjacency) and src/models/encoder.py (GCNEncoder) are written and tested. Training is NOT yet implemented.",
+      "current_state": "The notebook currently contains exploratory cells written interactively while building the normalised adjacency by hand, including a since-fixed bug where torch.diag was combined with broadcasting. It has no markdown structure.",
+      "critical_framing": "EVERY result in this notebook comes from a RANDOMLY INITIALISED, UNTRAINED encoder. This must be stated in the opening markdown cell and repeated in each figure title, because these plots would otherwise be mistaken for trained results. Their purpose is to establish a BASELINE against which the trained encoder is later compared.",
+      "inputs": {
+        "data/processed/features.npz": "keys X [128,105,13], tickers, dates, feature_names",
+        "data/processed/graphs.npz": "keys A [128,105,105], tickers, dates",
+        "data/universe_sp100.csv": "sector labels; use src.graphs.homophily.load_sector_labels, which handles the BRK.B / BRK-B normalisation"
+      }
+    },
+  
+    "notebook_structure": {
+      "style": "Match notebooks/03_graphs.ipynb: markdown headers using '#' syntax throughout, one markdown cell introducing each section and stating what result is expected BEFORE the code cell that produces it. Every plot gets a title and axis labels.",
+      "sections": [
+        "# Phase 4 — the GCN encoder  (opening markdown: what the encoder computes, the [128,105,13] + [128,105,105] -> [128,105,16] shape map, and the UNTRAINED caveat in bold)",
+        "## Setup — path anchor, imports, load artefacts, load sector labels",
+        "## Check 1 — the normalised adjacency: rebuild A_hat via normalise_adjacency, assert symmetry, assert max eigenvalue is 1.0 for a connected graph, and assert the A_hat @ sqrt(deg) == sqrt(deg) eigenvector identity. Keep a short markdown note that the top eigenvector is D^1/2 * 1, the DC mode, and that it is the component which survives repeated application — oversmoothing stated in eigenvalues.",
+        "## Check 2 — layer sanity: output shapes through both layers, and a permutation-equivariance demonstration in the notebook (separate from the pytest case) showing f(PX, PAP^T) == P f(X, A)",
+        "## Check 3 — variance propagation: input variance, hidden variance, output variance under Glorot; then the same under Kaiming for comparison. Markdown must record the finding that Kaiming gives roughly 10x the output variance, that this matches the predicted ratio (n_in + n_out)/n_in compounded across layers (5.9 x 1.25 = 7.4), and that Glorot was kept because effective rank barely differed — scale is absorbed by the next layer's weights during training, whereas effective rank measures how many directions carry information.",
+        "## Check 4 — spectral entropy and effective rank  (NEW, see visuals below)",
+        "## Check 5 — the untrained baseline embedding space  (NEW, see visuals below)",
+        "## Summary — a short table of the baseline numbers to compare against after training"
+      ]
+    },
+  
+    "new_visual_1": {
+      "section": "## Check 4 — spectral entropy and effective rank",
+      "purpose": "Show how many directions of the embedding space actually carry information, and how that compares to the raw features.",
+      "maths_to_state_in_markdown": "For singular values s_1 >= ... >= s_d of Z, define p_k = s_k / sum_j s_j. The spectral entropy is H = -sum_k p_k log p_k and the effective rank is erank(Z) = exp(H). This is a continuous count of how many dimensions are genuinely in use: a perfectly flat spectrum over d dimensions gives erank = d, and a rank-one matrix gives erank = 1. Note the hard ceiling: X has only 13 features, so Z lives in at most a 13-dimensional subspace no matter what embed_dim is set to.",
+      "figures": [
+        "Figure 4a — a two-panel figure for a single mid-sample date. Left panel: the normalised singular value spectrum p_k against k, for BOTH the raw features X[t] and the embedding Z[t], on the same axes with a legend. Right panel: the cumulative sum of p_k for both, with a horizontal line at 0.9 so the reader can see how many components carry 90% of the spectral mass. Title must include the date and the word 'untrained'.",
+        "Figure 4b — effective rank across ALL 128 dates, as a time series, for both X and Z on the same axes. Add a horizontal dashed line at 13 labelled 'ceiling: n_features'. This shows whether the encoder's spectral behaviour is stable over time or varies with regime.",
+        "Figure 4c — a histogram of the per-date effective rank of Z across the 128 dates, with the mean marked. This is the 'entropy distribution' proper: it shows the spread of the effective-rank statistic rather than a single snapshot."
+      ],
+      "printed_output": "Mean, std, min and max of erank(Z) and erank(X) across all dates, and the date at which erank(Z) is lowest."
+    },
+  
+    "new_visual_2": {
+      "section": "## Check 5 — the untrained baseline embedding space",
+      "purpose": "Show whether the graph convolution alone — before any training — already improves sector separation relative to the raw features. This is the baseline the trained encoder must beat.",
+      "method": "Project to 2D with PCA from sklearn.decomposition. Use PCA rather than UMAP or t-SNE: it is deterministic, adds no dependency, and its axes are interpretable as directions of maximum variance. Fit the PCA separately for X and for Z, since they live in different spaces.",
+      "figures": [
+        "Figure 5a — a side-by-side scatter for a single mid-sample date. Left: PCA of the raw features X[t]. Right: PCA of the embeddings Z[t]. Both coloured by GICS sector using the same colour map and a single shared legend placed outside the axes. Annotate each panel's axis labels with the variance explained by that component. Titles must say 'untrained encoder'.",
+        "Figure 5b — the same side-by-side for a crisis date (the rebalance date nearest 2020-03-31) and a calm date (nearest 2019-06-30), so four panels in total, to show whether sector separation is regime dependent."
+      ],
+      "quantitative_companion": "Alongside the figures, compute silhouette_score from sklearn.metrics against the GICS sector labels, in the FULL embedding space (not the 2D projection), for both X and Z, at every date. Print the mean of each and plot both as a time series. Markdown must state plainly what this measures and what it does not: a higher silhouette for Z than for X would mean the graph convolution sharpens sector structure even at random initialisation, which would be a property of the propagation operator A_hat rather than of anything learned. State explicitly that a negative or near-zero silhouette is a normal result here and does not indicate a bug — sectors are not expected to be cleanly separated clusters in a 13-dimensional standardised feature space."
+    },
+  
+    "cleanup": [
+      "Remove every exploratory cell from the interactive build of the normalised adjacency, including the torch.diag bug and its diagnostics. Check 1 replaces them.",
+      "Remove any cell whose output is an error or traceback.",
+      "Ensure the path-anchor cell (walking up to the directory containing .git and chdir-ing there) is the first cell.",
+      "Set a fixed torch.manual_seed and numpy seed in the setup cell, and state in markdown that this is required for the untrained baseline numbers to be reproducible, since the encoder weights are random.",
+      "Run the notebook top to bottom and commit it with outputs intact."
+    ],
+  
+    "constraints": [
+      "Do not modify src/models/layers.py or src/models/encoder.py.",
+      "Do not implement any training loop, loss function, or objective. This notebook is diagnostics only.",
+      "Dependencies: torch, numpy, pandas, matplotlib, scikit-learn. Do not add umap-learn or any new package.",
+      "Do not present any figure or number without the untrained caveat attached.",
+      "Use the encoder's default configuration (hidden_dim 64, embed_dim 16, n_layers 2, dropout 0.2) and call the encoder in eval mode (enc.eval()) inside torch.no_grad() so dropout is disabled — otherwise the baseline numbers are stochastic across cells and will not reproduce."
+    ],
+  
+    "verification": {
+      "steps": [
+        "jupyter nbconvert --to notebook --execute --inplace notebooks/04_embeddings.ipynb"
+      ],
+      "expected": [
+        "The notebook executes top to bottom with no errors.",
+        "Check 1's max-eigenvalue assertion passes at exactly 1.0 within tolerance.",
+        "erank(Z) is well above 1 and below the 13-feature ceiling.",
+        "All five figures render with titles, axis labels and legends."
+      ],
+      "on_mismatch": "Report the actual numbers rather than adjusting a tolerance or a plot range to make the result look cleaner."
+    },
+  
+    "deliverables": [
+      "notebooks/04_embeddings.ipynb, restructured, executed, with outputs",
+      "the printed effective-rank summary statistics for X and Z",
+      "the printed mean silhouette scores for X and Z",
+      "a one-paragraph summary of what the baseline establishes and which numbers should be re-measured after training"
+    ]
+  }
