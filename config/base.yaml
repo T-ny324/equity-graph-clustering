@@ -60,3 +60,28 @@ mi:
   # the cost is acceptable.
   subsample_dates: null          # full 128-date run
   cache_dir: data/processed/_mi_cache
+
+model:
+  hidden_dim: 64                 # width of the first GCN layer
+  embed_dim: 16                  # Z dimension. Bounded above by the five
+                                 # eigenvalues clearing the MP edge — more
+                                 # dimensions than that is fitting noise
+  n_layers: 2                    # each layer = one hop. Deeper oversmooths:
+                                 # repeated averaging drives every embedding
+                                 # toward the same vector, fatal for clustering
+  dropout: 0.2
+  activation: relu
+
+training:
+  objective: gae                 # gae -> dgi -> multitask, in that order
+  lr: 0.01
+  weight_decay: 5.0e-4
+  epochs: 200
+  patience: 20                   # early stopping on validation loss
+  seed: 42
+  refit_freq: 12                 # months between refits; walk-forward, never
+                                 # a single fit pooled over all 128 dates
+  train_window: 36               # rebalance dates per training window
+  embargo: 1                     # months held out between train and embed
+  graph_source: correlation      # correlation | mutual_information
+  device: cpu                    # N=105 is small; MPS sparse support is patchy
