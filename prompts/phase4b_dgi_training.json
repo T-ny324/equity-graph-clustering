@@ -1,0 +1,148 @@
+{
+    "task": "Build src/models/objectives.py and src/models/train.py — the Deep Graph Infomax objective with an optional auxiliary volatility head, and the walk-forward training loop that produces data/processed/embeddings.npz.",
+  
+    "context": {
+      "project": "Dynamic equity clustering with temporal GNNs.",
+      "repo_root": "the current working directory",
+      "already_built": {
+        "src/models/layers.py": "GraphConv(in_dim, out_dim) with forward(H, A_hat); normalise_adjacency(A) returning D^-1/2 (A+I) D^-1/2. Tested, including permutation equivariance.",
+        "src/models/encoder.py": "GCNEncoder(in_dim, hidden_dim=64, embed_dim=16, n_layers=2, dropout=0.2) with forward(X, A, normalise=True). Pass normalise=False when A_hat is precomputed.",
+        "src/graphs/homophily.py": "load_sector_labels(universe_csv, tickers) handles the BRK.B / BRK-B normalisation."
+      },
+      "inputs": {
+        "data/processed/features.npz": "X [128,105,13] float64, tickers, dates, feature_names. Cross-sectionally standardised, clipped at +/-3.",
+        "data/processed/graphs.npz": "A [128,105,105] float32 weighted correlation kNN, k=10, union symmetrised. Also A_binary, C, dates, tickers.",
+        "data/processed/panel.parquet": "long panel with date, ticker, log_ret — needed to build the volatility target."
+      },
+      "output": "data/processed/embeddings.npz",
+      "verified_alignment": "Ticker order and date lists are identical across features.npz and graphs.npz (105 tickers, 128 dates, 2016-01-29 to 2026-08-26). Assert this rather than assuming it."
+    },
+  
+    "objective_dgi": {
+      "reference": "Velickovic et al., Deep Graph Infomax. See docs/phase4_maths_reference.md section 4.2.",
+      "formulation": "Corrupt the features by permuting rows: X_tilde = P X, with the graph A left untouched. Encode both: Z = f(X, A_hat), Z_tilde = f(X_tilde, A_hat). Form the graph summary s = sigmoid(mean over nodes of Z). Score with a bilinear discriminator D(z, s) = sigmoid(z^T W s). The loss is the binary cross-entropy of a joint classification: real embeddings labelled 1, corrupted embeddings labelled 0. L = -(1/2N)[sum_i log D(z_i, s) + sum_i log(1 - D(z_tilde_i, s))].",
+      "why_shuffling_works": "Put this in the docstring. Row-shuffling preserves the marginal feature distribution exactly — every volatility and beta is still present, merely assigned to the wrong asset. The encoder therefore cannot separate real from corrupted by feature values alone; the only usable signal is whether a node's features are consistent with its graph position. Winning the discrimination task requires learning the feature-structure relationship, which is precisely what Z should encode.",
+      "components": [
+        "class Discriminator(nn.Module): a single bilinear weight W of shape (embed_dim, embed_dim), initialised with Glorot. forward(z, s) returns the logit z @ W @ s, NOT the sigmoid — use BCEWithLogitsLoss downstream for numerical stability.",
+        "def corrupt(X, generator) -> torch.Tensor: return X indexed by a random row permutation drawn from the supplied torch.Generator, so corruption is reproducible under a seed.",
+        "class DGILoss(nn.Module): holds the Discriminator. forward(Z, Z_corrupt) returns the scalar loss. Compute the summary internally as sigmoid(Z.mean(dim=0))."
+      ]
+    },
+  
+    "objective_vol_head": {
+      "formulation": "A linear head y_hat = w^T z + b predicting the cross-sectionally standardised realised volatility over the interval (t, t+1]. Loss is mean squared error. Total loss L = L_dgi + lambda * L_vol.",
+      "target_construction": "For each rebalance date t, compute realised volatility from the daily log returns strictly AFTER t up to and including the next rebalance date t+1: sqrt(252) * std of those returns. Then standardise cross-sectionally at each date using the same robust median/MAD/clip procedure as src.features.node_features.standardise — import and reuse that function, do not reimplement it. The final rebalance date has no forward window, so its target is NaN and it must be masked out of the loss.",
+      "leakage_rule": "CRITICAL. The volatility target is realised after t. It may appear ONLY in the loss term, never in the encoder input, never in X, never in the graph. Add an explicit comment at the point where the target is used stating this. The target must be built once, up front, and stored separately from X.",
+      "why_volatility_not_returns": "Put this in the docstring. Volatility is persistent and predictable; monthly returns are close to unpredictable. Using returns as the auxiliary target would fit noise and invite an unearned alpha claim. Volatility provides a genuine learnable signal and a defensible out-of-sample number.",
+      "default": "lambda defaults to 0.0 in config, so the head is built and wired but contributes nothing until enabled. This makes DGI-alone versus DGI-plus-vol-head a one-line ablation rather than a code change."
+    },
+  
+    "training_loop": {
+      "file": "src/models/train.py",
+      "protocol": "Walk-forward. For each refit: train on the `train_window` rebalance dates ending at t, skip `embargo` dates, then embed the next `refit_freq` dates with frozen weights. Advance by `refit_freq` and repeat until the date range is exhausted.",
+      "why_walk_forward": "Put this in the module docstring. A single fit pooled over all 128 dates leaks — the encoder would have seen 2026 while embedding 2017 — and unlike a supervised task nothing warns you, because the loss looks fine and the clusters look coherent. The embargo exists because features use trailing windows up to 252 days and graphs use 252-day correlation windows, so two adjacent rebalance dates share about 92% of their underlying data; without a gap the train and embed windows overlap through the features even when the dates do not.",
+      "functions": [
+        "def build_vol_target(panel_path, dates, tickers) -> np.ndarray: the [T, N] standardised forward volatility target described above, with the final row NaN.",
+        "def precompute_A_hat(A) -> torch.Tensor: normalise every adjacency once, up front. A_hat is identical across all epochs for a given date, so recomputing it inside the loop would repeat an O(N^2) operation `epochs` times per date. Pass normalise=False to the encoder thereafter.",
+        "def train_window(X_win, A_hat_win, y_win, cfg, seed) -> tuple[GCNEncoder, dict]: train one refit. Each epoch iterates over the dates in the window, accumulating the loss across them, then steps the optimiser once per epoch. Use Adam with cfg lr and weight_decay. Hold out the last 20% of the window's dates as a validation split for early stopping on validation loss with cfg patience, restoring the best weights. Return the trained encoder and a dict of per-epoch train and validation losses.",
+        "def embed(encoder, X_slice, A_hat_slice) -> np.ndarray: encoder.eval() inside torch.no_grad(), so dropout is disabled and the embeddings are deterministic. Returns [n_dates, N, embed_dim].",
+        "def walk_forward(X, A_hat, y, dates, cfg) -> tuple[np.ndarray, pd.DataFrame]: the full loop. Returns Z of shape [T, N, embed_dim] and a DataFrame of per-refit diagnostics. Dates before the first refit's embed window have no trained encoder and must be filled with NaN, not with an untrained embedding — record how many such dates there are.",
+        "def main() -> None"
+      ],
+      "diagnostics_per_refit": [
+        "refit index, train date range, embed date range",
+        "final train loss, final validation loss, epochs run, whether early stopping triggered",
+        "mean effective rank of Z over the embed window, computed as exp of the spectral entropy of the singular values — this is the oversmoothing check and it must be logged every refit",
+        "mean embedding variance over the embed window",
+        "if lambda > 0: the out-of-sample Spearman rank correlation between predicted and realised volatility on the embed window, per date and averaged. This is the only hard supervised number in the project and must be printed prominently."
+      ],
+      "output_artifact": "np.savez_compressed to data/processed/embeddings.npz with keys: Z [T,N,embed_dim] float32, dates (ISO strings), tickers, refit_log (the diagnostics DataFrame as a CSV string or structured array), config_json (a JSON string of the model and training config blocks, so the artefact records how it was built — matching the convention already used in graphs.npz and graphs_mi.npz)."
+    },
+  
+    "config_additions": {
+      "file": "config/base.yaml",
+      "note": "The model and training blocks may already exist. If so, reconcile rather than duplicating — config/base.yaml has previously carried a duplicate data.end key and that must not recur.",
+      "model": {
+        "hidden_dim": 64,
+        "embed_dim": 16,
+        "n_layers": 2,
+        "dropout": 0.2,
+        "init": "glorot"
+      },
+      "training": {
+        "objective": "dgi",
+        "vol_lambda": 0.0,
+        "lr": 0.01,
+        "weight_decay": 5.0e-4,
+        "epochs": 200,
+        "patience": 20,
+        "seed": 42,
+        "train_window": 36,
+        "embargo": 1,
+        "refit_freq": 12,
+        "graph_source": "correlation",
+        "device": "cpu"
+      },
+      "comments_to_add": [
+        "init: glorot — kept over kaiming; kaiming gives ~10x the output variance, matching the predicted ratio (n_in+n_out)/n_in compounded across layers, but effective rank barely differed. Scale is absorbed by the next layer's weights during training; effective rank measures how many directions carry information.",
+        "vol_lambda: 0.0 — the auxiliary volatility head is built and wired but contributes nothing by default. Raise it to enable the DGI-plus-vol ablation.",
+        "embed_dim: 16 — bounded above by the five correlation eigenvalues clearing the Marchenko-Pastur edge. More dimensions than that is fitting noise.",
+        "n_layers: 2 — each layer is one hop. Deeper oversmooths: the spectral response (1-lambda)^L drives every component except DC toward zero, collapsing all embeddings onto one vector.",
+        "graph_source: correlation — Part A beat Part B on persistence (0.746 vs 0.458), homophily and smoothness. Switch to mutual_information for the ablation."
+      ]
+    },
+  
+    "tests": {
+      "file": "tests/test_objectives.py",
+      "framework": "pytest",
+      "constraint": "Synthetic data inline. Do NOT read data/processed/*.",
+      "cases": [
+        "corrupt: returns a permutation of the input rows — the sorted rows of the output equal the sorted rows of the input, and for N > 2 with a fixed seed at least one row has moved.",
+        "corrupt: reproducible under the same torch.Generator seed, different under a different seed.",
+        "Discriminator: output shape is (N,) for inputs of shape (N, d) and (d,).",
+        "DGILoss: returns a positive scalar, and is close to log(2) ~ 0.693 at initialisation, since an untrained bilinear discriminator scores real and corrupted embeddings alike.",
+        "DGILoss: strictly decreases over a few hundred optimiser steps on a toy graph where features and structure are deliberately correlated — this demonstrates the objective is learnable.",
+        "vol head: the MSE term correctly ignores NaN targets, verified by comparing the loss with and without a NaN row appended.",
+        "build_vol_target: on a synthetic panel with known constant volatility per ticker, the pre-standardisation values match sqrt(252)*sigma; and the final rebalance date's row is all NaN.",
+        "NO LOOKAHEAD, the most important test: build_vol_target for date t must be unchanged when all returns strictly before t are corrupted, and MUST change when returns in (t, t+1] are corrupted. This pins down that the target window is forward-looking and that it is used only as a target."
+      ]
+    },
+  
+    "constraints": [
+      "Do not modify src/models/layers.py, src/models/encoder.py, src/features/, src/graphs/, or src/data/.",
+      "Import standardise from src.features.node_features rather than reimplementing the robust median/MAD/clip procedure.",
+      "Dependencies: torch, numpy, pandas, scipy, pyyaml. Add torch to requirements.txt with its exact installed version. Also add joblib, which src/graphs/mutual_info.py imports directly but which is currently present only as a transitive dependency of scikit-learn.",
+      "Do not use torch_geometric. At N=105 dense matmul is faster than sparse message passing and simpler to debug.",
+      "Do not implement clustering, temporal alignment, or any Phase 5 work.",
+      "Preserve the existing style: from __future__ import annotations, type hints on all signatures, numpy-style docstrings, print-based run logging.",
+      "Set all seeds (torch, numpy, and the corruption generator) from cfg.training.seed so a rerun reproduces exactly.",
+      "Do not create a notebook."
+    ],
+  
+    "verification": {
+      "steps": [
+        "python -m pytest tests/test_objectives.py -v",
+        "python -m src.models.train"
+      ],
+      "expected": [
+        "All tests pass.",
+        "Roughly 8 refits over the 128 dates with train_window=36, embargo=1, refit_freq=12.",
+        "Z.shape == (128, 105, 16), with the leading dates before the first embed window filled with NaN and that count reported.",
+        "DGI loss starts near 0.693 and decreases within each refit.",
+        "Effective rank of Z stays well above 1 at every refit — a collapse toward 1 is oversmoothing under the loss and is a real failure, not a tolerance issue.",
+        "The whole run completes in minutes on CPU."
+      ],
+      "on_mismatch": "Report the actual numbers. Do not widen a tolerance, reduce epochs, or change the architecture to make a check pass. If effective rank collapses, report it — that is a finding about the objective, not a bug to be tuned away."
+    },
+  
+    "deliverables": [
+      "src/models/objectives.py",
+      "src/models/train.py",
+      "tests/test_objectives.py",
+      "the reconciled model and training blocks in config/base.yaml",
+      "torch and joblib added to requirements.txt at exact versions",
+      "data/processed/embeddings.npz",
+      "the printed per-refit diagnostics table",
+      "a short summary: number of refits, NaN date count, mean effective rank of Z, mean embedding variance, and the loss trajectory of the first and last refit"
+    ]
+  }
