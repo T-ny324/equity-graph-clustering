@@ -64,24 +64,45 @@ mi:
 model:
   hidden_dim: 64                 # width of the first GCN layer
   embed_dim: 16                  # Z dimension. Bounded above by the five
-                                 # eigenvalues clearing the MP edge — more
-                                 # dimensions than that is fitting noise
-  n_layers: 2                    # each layer = one hop. Deeper oversmooths:
-                                 # repeated averaging drives every embedding
-                                 # toward the same vector, fatal for clustering
+                                 # correlation eigenvalues clearing the
+                                 # Marchenko-Pastur edge; more dimensions
+                                 # than that is fitting noise
+  n_layers: 2                    # each layer is one hop. Deeper oversmooths:
+                                 # the spectral response (1-lambda)^L drives
+                                 # every component except DC toward zero,
+                                 # collapsing all embeddings onto one vector
   dropout: 0.2
   activation: relu
+  init: glorot                   # kept over kaiming. Kaiming gives roughly
+                                 # 7-15x the output variance (14.8x on one
+                                 # draw, 7.4x averaged over re-draws, which
+                                 # is the predicted (n_in+n_out)/n_in
+                                 # compounded across layers), but effective
+                                 # rank barely differed (8.4 vs 7.6). Scale
+                                 # is absorbed by the next layer's weights
+                                 # during training; effective rank measures
+                                 # how many directions carry information
 
 training:
-  objective: gae                 # gae -> dgi -> multitask, in that order
+  objective: dgi                 # Deep Graph Infomax; src/models/objectives.py
+  vol_lambda: 0.0                # weight of the auxiliary volatility head.
+                                 # 0.0: built and wired but contributes
+                                 # nothing. Raise it to enable the
+                                 # DGI-plus-vol ablation
   lr: 0.01
   weight_decay: 5.0e-4
   epochs: 200
   patience: 20                   # early stopping on validation loss
-  seed: 42
-  refit_freq: 12                 # months between refits; walk-forward, never
-                                 # a single fit pooled over all 128 dates
+  seed: 42                       # torch, numpy and the corruption generator
   train_window: 36               # rebalance dates per training window
-  embargo: 1                     # months held out between train and embed
-  graph_source: correlation      # correlation | mutual_information
+  embargo: 1                     # dates held out between train and embed:
+                                 # adjacent dates share ~92% of their
+                                 # trailing-window data
+  refit_freq: 12                 # dates embedded per refit before the next
+                                 # fit; walk-forward, never a single fit
+                                 # pooled over all 128 dates
+  graph_source: correlation      # Part A beat Part B on persistence (0.746
+                                 # vs 0.458), homophily and smoothness.
+                                 # Switch to mutual_information for the
+                                 # ablation
   device: cpu                    # N=105 is small; MPS sparse support is patchy
